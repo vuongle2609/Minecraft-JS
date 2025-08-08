@@ -382,6 +382,16 @@ export default class ChunkManager extends BlockManager {
     }
   }
 
+  update() {
+    // Call parent update for hover block handling
+    super.update();
+    
+    // Update frustum culling for all chunks based on camera frustum
+    if (this.camera && this.instancedBlockManager) {
+      this.instancedBlockManager.updateAllChunksFrustum(this.camera);
+    }
+  }
+
   dispose() {
     this.disposeBlockManager();
     Object.values(this.chunkWorkers).forEach(({ worker }) => {

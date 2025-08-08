@@ -1,4 +1,4 @@
-import { Scene, Group, InstancedMesh, Matrix4, Vector3, Euler, InstancedBufferAttribute } from "three";
+import { Scene, Group, InstancedMesh, Matrix4, Vector3, Euler, InstancedBufferAttribute, Frustum, Box3, Camera } from "three";
 import { BLOCK_WIDTH, CHUNK_SIZE } from "@/constants";
 import { Face } from "@/constants/block";
 import blocks, { renderGeometry } from "@/constants/blocks";
@@ -18,6 +18,9 @@ export default class ChunkInstancedBlockManager {
   private instanceAllocations: Map<string, InstanceInfo[]> = new Map(); // blockKey -> instance info
   private initialPoolSize = 500; // Smaller pool per chunk (16x16x256 max blocks)
   private poolGrowthFactor = 1.5;
+  private chunkBounds: { minX: number; maxX: number; minZ: number; maxZ: number };
+  private chunkBoundingBox: Box3; // 3D bounding box for frustum intersection testing
+  private currentFrustumState: boolean = true; // Track current frustum state to avoid redundant updates
 
   constructor(chunkName: string, chunkX: number, chunkZ: number, blocksGroup: Group) {
     this.chunkName = chunkName;
@@ -29,6 +32,28 @@ export default class ChunkInstancedBlockManager {
       (chunkX * CHUNK_SIZE + CHUNK_SIZE / 2) * BLOCK_WIDTH,
       0, // Y position at world level, instances will be offset from here
       (chunkZ * CHUNK_SIZE + CHUNK_SIZE / 2) * BLOCK_WIDTH
+    );
+    
+    // Calculate chunk boundaries for frustum culling checks
+    this.chunkBounds = {
+      minX: chunkX * CHUNK_SIZE * BLOCK_WIDTH,
+      maxX: (chunkX + 1) * CHUNK_SIZE * BLOCK_WIDTH,
+      minZ: chunkZ * CHUNK_SIZE * BLOCK_WIDTH,
+      maxZ: (chunkZ + 1) * CHUNK_SIZE * BLOCK_WIDTH
+    };
+    
+    // Create 3D bounding box for frustum intersection testing (includes full world height)
+    this.chunkBoundingBox = new Box3(
+      new Vector3(
+        this.chunkBounds.minX,
+        0,  // Min Y at ground level
+        this.chunkBounds.minZ
+      ),
+      new Vector3(
+        this.chunkBounds.maxX,
+        256 * BLOCK_WIDTH,  // Max Y at world height limit (256 blocks)
+        this.chunkBounds.maxZ
+      )
     );
     
     this.initializeInstancedMeshes();
@@ -283,6 +308,36 @@ export default class ChunkInstancedBlockManager {
    */
   getChunkName(): string {
     return this.chunkName;
+  }
+
+  /**
+   * Update frustum culling based on camera frustum intersection with chunk bounding box
+   * Disables frustum culling when camera frustum intersects with chunk volume
+   */
+  updateFrustumCulling(frustum: Frustum): boolean {
+    // Check if camera frustum intersects with chunk's 3D bounding box
+    const shouldRender = frustum.intersectsBox(this.chunkBoundingBox);
+    
+    // Only update if state has changed to avoid redundant operations
+    const newFrustumState = !shouldRender;  // Invert: if should render, disable frustum culling
+    if (this.currentFrustumState !== newFrustumState) {
+      this.currentFrustumState = newFrustumState;
+      
+      // Set frustumCulled for all meshes in this chunk
+      // If chunk is in view (shouldRender=true), disable frustum culling (frustumCulled=false)
+      // If chunk is not in view (shouldRender=false), enable frustum culling (frustumCulled=true)
+      Object.keys(this.instancedMeshes).forEach((blockType) => {
+        const blockMeshes = this.instancedMeshes[parseInt(blockType) as BlockKeys];
+        Object.keys(blockMeshes).forEach((faceType) => {
+          const pool = blockMeshes[parseInt(faceType) as BlockTextureType];
+          if (pool?.mesh) {
+            pool.mesh.frustumCulled = !shouldRender;
+          }
+        });
+      });
+    }
+    
+    return shouldRender;
   }
 
   /**

@@ -1,4 +1,4 @@
-import { Scene, Group, Vector3, Euler } from "three";
+import { Scene, Group, Vector3, Euler, Frustum, Matrix4, Camera } from "three";
 import { CHUNK_SIZE, BLOCK_WIDTH } from "@/constants";
 import { Face } from "@/constants/block";
 import { BlockKeys, BlockTextureType, FaceAoType } from "@/type";
@@ -9,6 +9,10 @@ export default class InstancedBlockManager {
   private scene: Scene;
   private blocksGroup: Group;
   private chunkManagers: Map<string, ChunkInstancedBlockManager> = new Map();
+  private lastCameraChunk: string | null = null; // Track last chunk camera was in for optimization
+  private lastCameraRotation: Vector3 = new Vector3(); // Track camera rotation for changes
+  private frustumUpdateCounter: number = 0; // Counter for throttling frustum updates
+  private isFirstUpdate: boolean = true; // Force update on first frame
 
   constructor(scene: Scene, blocksGroup: Group) {
     this.scene = scene;
@@ -26,6 +30,9 @@ export default class InstancedBlockManager {
 
     const chunkManager = new ChunkInstancedBlockManager(chunkName, chunkX, chunkZ, this.blocksGroup);
     this.chunkManagers.set(chunkName, chunkManager);
+    
+    // Force immediate frustum update for newly created chunks
+    this.isFirstUpdate = true;
     
     console.log(`Created chunk manager for ${chunkName} at (${chunkX}, ${chunkZ})`);
     return chunkManager;
@@ -133,6 +140,60 @@ export default class InstancedBlockManager {
       chunkManager.dispose();
       this.chunkManagers.delete(chunkName);
       console.log(`Disposed chunk manager for ${chunkName}`);
+    }
+  }
+
+  /**
+   * Update frustum culling for all chunks based on camera frustum
+   * Runs every frame when camera moves or rotates
+   */
+  updateAllChunksFrustum(camera: Camera, forceUpdate: boolean = false) {
+    // Check if camera has moved or rotated
+    const currentCameraChunk = this.getChunkNameFromPosition(camera.position);
+    
+    // Check rotation changes (Euler doesn't have toVector3, so we check components)
+    const hasRotated = 
+      camera.rotation.x !== this.lastCameraRotation.x ||
+      camera.rotation.y !== this.lastCameraRotation.y ||
+      camera.rotation.z !== this.lastCameraRotation.z;
+    
+    const hasMoved = currentCameraChunk !== this.lastCameraChunk;
+    const needsUpdate = this.isFirstUpdate || hasRotated || hasMoved || forceUpdate;
+    
+    // Skip update only if camera hasn't moved or rotated
+    if (!needsUpdate) {
+      return;
+    }
+    
+    // Update tracking variables
+    this.lastCameraChunk = currentCameraChunk;
+    this.lastCameraRotation.set(camera.rotation.x, camera.rotation.y, camera.rotation.z);
+    this.isFirstUpdate = false;
+    this.frustumUpdateCounter++;
+    
+    // Create frustum from camera matrices
+    const frustum = new Frustum();
+    const matrix = new Matrix4();
+    
+    // Update camera matrices if needed
+    camera.updateMatrixWorld();
+    
+    // Combine projection and view matrices to get frustum
+    matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(matrix);
+    
+    // Update frustum culling for all active chunks
+    let visibleChunkCount = 0;
+    this.chunkManagers.forEach((chunkManager, chunkName) => {
+      const isVisible = chunkManager.updateFrustumCulling(frustum);
+      if (isVisible) {
+        visibleChunkCount++;
+      }
+    });
+    
+    // Debug logging (can be removed in production)
+    if (this.frustumUpdateCounter % 60 === 0) {  // Log every 60 updates (~1 second)
+      console.log(`Visible chunks: ${visibleChunkCount}/${this.chunkManagers.size}`);
     }
   }
 
