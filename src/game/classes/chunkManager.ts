@@ -12,6 +12,7 @@ import { getChunkNeighborsCoor } from "../helpers/chunkHelpers";
 import { detailFromName } from "../helpers/detailFromName";
 import { BasePropsType } from "./baseEntity";
 import BlockManager from "./blockManager";
+import { ChunkLoadingQueue, ChunkLoadRequest } from "./chunkLoadingQueue";
 import InventoryManager from "./inventoryManager";
 
 interface PropsType {
@@ -42,6 +43,7 @@ export default class ChunkManager extends BlockManager {
   chunkRendered = new Map();
 
   chunkRenderQueue: ChunkWorkerDataType[] = [];
+  chunkLoadingQueue: ChunkLoadingQueue;
 
   chunkPendingQueue: ChunkPendingQueueType[] = [];
   currentChunk = [0, 0];
@@ -170,12 +172,27 @@ export default class ChunkManager extends BlockManager {
 
         if (!this.chunkRendered.get(chunkName)) {
           this.chunkRendered.set(chunkName, true);
-          this.chunkRenderQueue.unshift({
+          
+          // Calculate priority based on distance from player
+          const [chunkX, chunkZ] = chunkName.split('_').map(Number);
+          const priority = ChunkLoadingQueue.calculatePriority(
+            chunkX,
+            chunkZ,
+            this.currentChunk[0],
+            this.currentChunk[1]
+          );
+          
+          // Add to loading queue instead of render queue
+          const request: ChunkLoadRequest = {
             chunkName,
+            chunk: { x: chunkX, z: chunkZ },
             arrayBlocksData: Array.from(arrayBlocksData) as any,
             facesToRender,
             blockOcclusion,
-          });
+            priority,
+          };
+          
+          this.chunkLoadingQueue.addChunkToQueue(request);
         }
 
         this.worker?.postMessage(
@@ -204,6 +221,7 @@ export default class ChunkManager extends BlockManager {
   constructor(props: BasePropsType & PropsType) {
     super(props);
 
+    this.chunkLoadingQueue = new ChunkLoadingQueue();
     this.setUpWorker();
     this.initialize();
   }
@@ -222,6 +240,7 @@ export default class ChunkManager extends BlockManager {
         z: number;
       };
       chunkName: string;
+      priority: number;
     }[] = [];
 
     const neighborChunksKeys = this.neighborOffset.map((offset) => {
@@ -231,10 +250,19 @@ export default class ChunkManager extends BlockManager {
       };
 
       const chunkName = nameChunkFromCoordinate(chunk.x, chunk.z);
+      
+      // Calculate priority based on distance from player
+      const priority = ChunkLoadingQueue.calculatePriority(
+        chunk.x, 
+        chunk.z, 
+        currentChunk.x, 
+        currentChunk.z
+      );
 
       chunkDetail.push({
         chunk,
         chunkName,
+        priority,
       });
 
       return chunkName;
@@ -243,28 +271,38 @@ export default class ChunkManager extends BlockManager {
     this.handleClearChunks(neighborChunksKeys);
 
     this.chunksActive = neighborChunksKeys;
+    
+    // Update the loading queue with active chunks
+    this.chunkLoadingQueue.updateActiveChunks(neighborChunksKeys);
+    
     this.chunkPendingQueueProxy.filterInactive();
 
-    chunkDetail.forEach(({ chunkName, chunk }) => {
-      this.handleAssignWorkerChunk(chunkName, chunk);
+    // Add chunks to the loading queue instead of immediately processing
+    chunkDetail.forEach(({ chunkName, chunk, priority }) => {
+      // Only add if not already loaded
+      if (!this.chunkLoadingQueue.isChunkLoaded(chunkName)) {
+        this.handleAssignWorkerChunk(chunkName, chunk);
+      }
     });
   }
 
   handleRenderChunksInQueue() {
-    const data = this.chunkRenderQueue.pop();
-
-    if (!data) return;
-
-    const { chunkName, arrayBlocksData, facesToRender, blockOcclusion } = data;
-
-    if (!this.chunksActive.includes(chunkName)) return;
-
-    this.handleRenderChunkBlocks(
-      chunkName,
-      arrayBlocksData,
-      facesToRender,
-      blockOcclusion
-    );
+    // Process next chunk from the loading queue
+    this.chunkLoadingQueue.processNextChunk((request: ChunkLoadRequest) => {
+      const { chunkName, arrayBlocksData, facesToRender, blockOcclusion } = request;
+      
+      // Double-check chunk is still active before rendering
+      if (!this.chunksActive.includes(chunkName)) {
+        return;
+      }
+      
+      this.handleRenderChunkBlocks(
+        chunkName,
+        arrayBlocksData,
+        facesToRender,
+        blockOcclusion
+      );
+    });
   }
 
   renderChunk = throttle(this.handleRenderChunksInQueue.bind(this), 0);
@@ -355,6 +393,9 @@ export default class ChunkManager extends BlockManager {
 
     inactiveChunk.forEach((item) => {
       this.chunkRendered.set(item, false);
+      
+      // Reset chunk state in loading queue
+      this.chunkLoadingQueue.resetChunkState(item);
 
       blocksDelete = [...blocksDelete, ...(this.chunksBlocks[item] || [])];
 
@@ -363,6 +404,9 @@ export default class ChunkManager extends BlockManager {
       // Dispose the chunk's InstancedBlockManager to free up GPU resources
       this.instancedBlockManager?.disposeChunkManager(item);
     });
+    
+    // Remove inactive chunks from the loading queue
+    this.chunkLoadingQueue.removeChunksFromQueue(inactiveChunk);
 
     blocksDelete.forEach((blockKey) => {
       const { y, x, z } = detailFromName(blockKey);
@@ -390,10 +434,19 @@ export default class ChunkManager extends BlockManager {
     if (this.camera && this.instancedBlockManager) {
       this.instancedBlockManager.updateAllChunksFrustum(this.camera);
     }
+    
+    // Debug: Log queue status periodically
+    if (Math.random() < 0.01) { // Log ~1% of frames
+      const debugInfo = this.chunkLoadingQueue.getDebugInfo();
+      if (debugInfo.pendingCount > 0 || debugInfo.currentLoading) {
+        console.log('Chunk Queue:', debugInfo);
+      }
+    }
   }
 
   dispose() {
     this.disposeBlockManager();
+    this.chunkLoadingQueue.dispose();
     Object.values(this.chunkWorkers).forEach(({ worker }) => {
       worker.terminate();
     });

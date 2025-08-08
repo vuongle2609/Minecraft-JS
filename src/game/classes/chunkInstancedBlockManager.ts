@@ -16,7 +16,7 @@ export default class ChunkInstancedBlockManager {
   private blocksGroup: Group;
   private instancedMeshes: BlocksIntancedMapping;
   private instanceAllocations: Map<string, InstanceInfo[]> = new Map(); // blockKey -> instance info
-  private initialPoolSize = 500; // Smaller pool per chunk (16x16x256 max blocks)
+  private initialPoolSize = 2000; // Initial pool size for 64x64 chunks
   private poolGrowthFactor = 1.5;
   private chunkBounds: { minX: number; maxX: number; minZ: number; maxZ: number };
   private chunkBoundingBox: Box3; // 3D bounding box for frustum intersection testing
