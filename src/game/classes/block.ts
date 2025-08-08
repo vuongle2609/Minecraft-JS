@@ -1,8 +1,9 @@
 import { Group, Mesh, Object3D, Vector3 } from "three";
 
 import { BLOCK_WIDTH } from "@/constants";
-import { BlockFaces, Face } from "@/constants/block";
+import { Face } from "@/constants/block";
 import blocks, { BlockAttributeType, renderGeometry } from "@/constants/blocks";
+import InstancedBlockManager from "./instancedBlockManager";
 import { nameFromCoordinate } from "@/game/helpers/nameFromCoordinate";
 import { BlockKeys, FaceAoType } from "@/type";
 import { calNeighborsOffset } from "../helpers/calNeighborsOffset";
@@ -14,6 +15,7 @@ interface PropsType {
   type: BlockKeys;
   blocksGroup: Group;
   blocksMapping: Map<string, Block>;
+  instancedBlockManager: InstancedBlockManager;
   facesToRender?: Record<Face, boolean> | null;
   isPlace?: boolean;
   blockOcclusion?: Record<Face, null | FaceAoType> | null;
@@ -22,7 +24,7 @@ interface PropsType {
 const { leftZ, rightZ, leftX, rightX, top, bottom } = Face;
 
 export default class Block extends BaseEntity {
-  blockFaces: BlockFaces = {
+  blockFaceInstances: Record<Face, number | null> = {
     [leftZ]: null,
     [rightZ]: null,
     [leftX]: null,
@@ -35,6 +37,7 @@ export default class Block extends BaseEntity {
   atttribute: BlockAttributeType;
   blocksMapping: Map<string, Block>;
   blocksGroup: Group;
+  instancedBlockManager: InstancedBlockManager;
   isPlace: boolean;
   blockOcclusion: Record<Face, null | FaceAoType> = {
     [leftZ]: null,
@@ -53,6 +56,7 @@ export default class Block extends BaseEntity {
       position,
       blocksMapping,
       blocksGroup,
+      instancedBlockManager,
       facesToRender,
       isPlace,
       blockOcclusion,
@@ -63,6 +67,7 @@ export default class Block extends BaseEntity {
     this.position = position;
     this.atttribute = blocks[type];
     this.blocksMapping = blocksMapping;
+    this.instancedBlockManager = instancedBlockManager;
     this.isPlace = !!isPlace;
     if (blockOcclusion) this.blockOcclusion = blockOcclusion;
 
@@ -109,14 +114,17 @@ export default class Block extends BaseEntity {
   }
 
   rerenderAO() {
-    Object.values(this.blockFaces).forEach((item) => {
-      if (item) {
-        this.blocksGroup?.remove(item);
-        item.geometry.dispose();
+    // Store which faces were active
+    const activeFaces: Record<Face, boolean> = {} as any;
+    Object.entries(this.blockFaceInstances).forEach(([faceKey, instanceIndex]) => {
+      const face = parseInt(faceKey) as Face;
+      activeFaces[face] = instanceIndex !== null;
+      if (instanceIndex !== null) {
+        this.removeFace(face);
       }
     });
 
-    this.renderWithKnownFace(this.blockFaces);
+    this.renderWithKnownFace(activeFaces);
   }
 
   render() {
@@ -179,35 +187,49 @@ export default class Block extends BaseEntity {
     }
   }
 
-  removeFace(face: keyof BlockFaces) {
-    this.blocksGroup?.remove(this.blockFaces[face] as Object3D);
+  removeFace(face: Face) {
+    const instanceIndex = this.blockFaceInstances[face];
+    if (instanceIndex === null) return;
+    
+    const blockKey = nameFromCoordinate(this.position.x, this.position.y, this.position.z);
+    const faceTextureType = this.atttribute.textureMap[face];
+    
+    this.instancedBlockManager.deallocateInstance(
+      blockKey,
+      instanceIndex,
+      this.type,
+      faceTextureType
+    );
+    
+    this.blockFaceInstances[face] = null;
   }
 
-  addFace(face: keyof BlockFaces) {
+  addFace(face: Face) {
+    // Skip if face already allocated
+    if (this.blockFaceInstances[face] !== null) return;
+    
     const faceAoKey = this.blockOcclusion[face] || "base";
-
-    const textureAo = this.atttribute.textureFaceAo;
-
-    const material =
-      textureAo[this.atttribute.textureMap[face] as keyof typeof textureAo][
-        faceAoKey
-      ];
-
-    const plane = new Mesh(renderGeometry, material);
-
-    const { rotation } = this.calFaceAttr(face);
-
-    const { x, y, z } = this.position;
-
-    plane.position.set(x, y, z);
-    plane.rotation.set(rotation[0], rotation[1], rotation[2]);
-    plane.name = nameFromCoordinate(x, y, z, this.type, face);
-
-    this.blockFaces[face] = plane;
-    this.blocksGroup?.add(plane);
+    const faceTextureType = this.atttribute.textureMap[face];
+    
+    // Get rotation for this face
+    const rotation = this.instancedBlockManager.getFaceRotation(face);
+    
+    // Allocate instance
+    const blockKey = nameFromCoordinate(this.position.x, this.position.y, this.position.z);
+    const instanceIndex = this.instancedBlockManager.allocateInstance(
+      blockKey,
+      this.type,
+      faceTextureType,
+      faceAoKey,
+      this.position,
+      rotation
+    );
+    
+    // Track the instance index
+    this.blockFaceInstances[face] = instanceIndex;
   }
 
-  calFaceAttr(face: keyof BlockFaces) {
+  calFaceAttr(face: Face) {
     switch (face) {
       case leftZ:
         return { rotation: [0, 0, 0] };
@@ -237,12 +259,9 @@ export default class Block extends BaseEntity {
   destroy(isClearChunk?: boolean) {
     const { x, y, z } = this.position;
 
-    Object.values(this.blockFaces).forEach((item) => {
-      if (item) {
-        this.blocksGroup?.remove(item);
-        item.geometry.dispose();
-      }
-    });
+    // Deallocate all instances for this block
+    const blockKey = nameFromCoordinate(x, y, z);
+    this.instancedBlockManager.deallocateAllInstances(blockKey);
 
     if (isClearChunk) return;
 

@@ -21,6 +21,7 @@ import { BLOCK_WIDTH } from "@/constants";
 import BaseEntity, { BasePropsType } from "./baseEntity";
 import Block from "./block";
 import InventoryManager from "./inventoryManager";
+import InstancedBlockManager from "./instancedBlockManager";
 
 const { leftX, leftZ, bottom, rightX, rightZ, top } = Face;
 
@@ -44,6 +45,8 @@ export default class BlockManager extends BaseEntity {
 
   blocksGroup = new Group();
 
+  instancedBlockManager: InstancedBlockManager;
+
   disposeBlockManager: Function;
 
   blockDisplayHover = new Mesh(
@@ -62,6 +65,9 @@ export default class BlockManager extends BaseEntity {
   }
 
   async initialize() {
+    // Initialize the InstancedBlockManager
+    this.instancedBlockManager = new InstancedBlockManager(this.scene!, this.blocksGroup);
+    
     this.blockDisplayHover.name = "helper";
     this.scene?.add(this.blockDisplayHover);
     this.scene?.add(this.blocksGroup);
@@ -72,6 +78,7 @@ export default class BlockManager extends BaseEntity {
 
     this.disposeBlockManager = () => {
       document.removeEventListener("mousedown", eventMouseDown, false);
+      this.instancedBlockManager?.dispose();
     };
 
     this.worker?.addEventListener("message", (e) => {
@@ -111,6 +118,7 @@ export default class BlockManager extends BaseEntity {
       position: position,
       type: type,
       blocksMapping: this.blocksMapping,
+      instancedBlockManager: this.instancedBlockManager,
       facesToRender,
       blocksGroup: this.blocksGroup,
       blockOcclusion,

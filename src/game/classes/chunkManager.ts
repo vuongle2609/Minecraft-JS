@@ -359,6 +359,9 @@ export default class ChunkManager extends BlockManager {
       blocksDelete = [...blocksDelete, ...(this.chunksBlocks[item] || [])];
 
       delete this.chunksBlocks[item];
+      
+      // Dispose the chunk's InstancedBlockManager to free up GPU resources
+      this.instancedBlockManager?.disposeChunkManager(item);
     });
 
     blocksDelete.forEach((blockKey) => {
