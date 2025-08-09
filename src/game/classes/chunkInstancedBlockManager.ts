@@ -7,6 +7,7 @@ import { BlockKeys, BlockTextureType, FaceAoType, BlocksIntancedMapping, BlocksI
 interface InstanceInfo {
   blockType: BlockKeys;
   faceType: BlockTextureType;
+  aoType: FaceAoType | "base";
   instanceIndex: number;
 }
 
@@ -60,20 +61,39 @@ export default class ChunkInstancedBlockManager {
   }
 
   private initializeInstancedMeshes() {
-    // Initialize InstancedMesh pools for each block type and face type combination
+    // Initialize InstancedMesh pools for each block type, texture type, and AO type combination
     Object.values(BlockKeys).forEach((blockType) => {
       if (typeof blockType === 'number') {
         this.instancedMeshes[blockType] = {} as BlocksIntancedType;
         
-        // For each face texture type, create one InstancedMesh positioned at chunk center
-        Object.values(BlockTextureType).forEach((faceType) => {
-          if (typeof faceType === 'number') {
-            const blockData = blocks[blockType];
-            const material = blockData.texture[faceType];
+        const blockData = blocks[blockType];
+        
+        // Only create InstancedMesh for texture types that actually exist for this block
+        Object.keys(blockData.texture).forEach((faceTypeKey) => {
+          const faceType = parseInt(faceTypeKey) as BlockTextureType;
+          const baseMaterial = blockData.texture[faceType];
+          if (!baseMaterial || !baseMaterial.map) {
+            return; // Skip if no material or texture
+          }
+          
+          // Initialize AO variant pools for this texture type
+          this.instancedMeshes[blockType][faceType] = {} as Record<FaceAoType | "base", {
+            mesh: InstancedMesh;
+            count: number;
+            indexCanAllocate: number[];
+          }>;
+          
+          // Get AO materials from the existing textureFaceAo system
+          const aoMaterials = blockData.textureFaceAo[faceType];
+          
+          // Create InstancedMesh for each AO type (base, e1-e4, f1-f4, v1-v4)
+          Object.keys(aoMaterials).forEach((aoTypeKey) => {
+            const aoType = aoTypeKey as FaceAoType | "base";
+            const aoMaterial = aoMaterials[aoType];
             
             const instancedMesh = new InstancedMesh(
               renderGeometry, 
-              material, 
+              aoMaterial, 
               this.initialPoolSize
             );
             
@@ -82,21 +102,17 @@ export default class ChunkInstancedBlockManager {
             instancedMesh.instanceMatrix.setUsage(35048); // THREE.DynamicDrawUsage
             instancedMesh.count = 0; // Start with 0 visible instances
             
-            // Add AO instance attribute
-            const aoAttribute = new InstancedBufferAttribute(new Float32Array(this.initialPoolSize), 1);
-            instancedMesh.geometry.setAttribute('instanceAO', aoAttribute);
-            
             // Set name for debugging
-            instancedMesh.name = `${this.chunkName}_${blockType}_${faceType}`;
+            instancedMesh.name = `${this.chunkName}_${blockType}_${faceType}_${aoType}`;
             
-            this.instancedMeshes[blockType][faceType] = {
+            this.instancedMeshes[blockType][faceType][aoType] = {
               mesh: instancedMesh,
               count: 0,
               indexCanAllocate: Array.from({ length: this.initialPoolSize }, (_, i) => i)
             };
             
             this.blocksGroup.add(instancedMesh);
-          }
+          });
         });
       }
     });
@@ -113,16 +129,16 @@ export default class ChunkInstancedBlockManager {
     worldPosition: Vector3,
     rotation: Euler
   ): number {
-    const pool = this.getPool(blockType, faceType);
+    const pool = this.getPool(blockType, faceType, aoType);
     
     if (!pool) {
-      console.error(`Pool not found for ${blockType}_${faceType} in chunk ${this.chunkName}`);
+      console.error(`Pool not found for ${blockType}_${faceType}_${aoType} in chunk ${this.chunkName}`);
       return -1;
     }
 
     // Check if we need to resize the pool
     if (pool.indexCanAllocate.length === 0) {
-      this.resizePool(blockType, faceType);
+      this.resizePool(blockType, faceType, aoType);
     }
 
     // Get an available instance index
@@ -139,12 +155,6 @@ export default class ChunkInstancedBlockManager {
     pool.mesh.setMatrixAt(instanceIndex, matrix);
     pool.mesh.instanceMatrix.needsUpdate = true;
     
-    // Set AO value for this instance
-    const aoValue = this.getAOValue(aoType);
-    const aoAttribute = pool.mesh.geometry.getAttribute('instanceAO') as InstancedBufferAttribute;
-    aoAttribute.setX(instanceIndex, aoValue);
-    aoAttribute.needsUpdate = true;
-    
     // Update visible instance count
     pool.count++;
     pool.mesh.count = Math.max(pool.mesh.count, instanceIndex + 1);
@@ -156,6 +166,7 @@ export default class ChunkInstancedBlockManager {
     this.instanceAllocations.get(blockKey)!.push({
       blockType,
       faceType,
+      aoType,
       instanceIndex
     });
     
@@ -165,8 +176,8 @@ export default class ChunkInstancedBlockManager {
   /**
    * Deallocate an instance
    */
-  deallocateInstance(blockKey: string, instanceIndex: number, blockType: BlockKeys, faceType: BlockTextureType) {
-    const pool = this.getPool(blockType, faceType);
+  deallocateInstance(blockKey: string, instanceIndex: number, blockType: BlockKeys, faceType: BlockTextureType, aoType: FaceAoType | "base") {
+    const pool = this.getPool(blockType, faceType, aoType);
     if (!pool) return;
 
     // Hide this instance by setting it to zero matrix
@@ -184,7 +195,8 @@ export default class ChunkInstancedBlockManager {
       const index = allocations.findIndex(
         alloc => alloc.instanceIndex === instanceIndex && 
                  alloc.blockType === blockType && 
-                 alloc.faceType === faceType
+                 alloc.faceType === faceType &&
+                 alloc.aoType === aoType
       );
       if (index !== -1) {
         allocations.splice(index, 1);
@@ -201,7 +213,7 @@ export default class ChunkInstancedBlockManager {
 
     // Deallocate each instance
     [...allocations].forEach(alloc => {
-      this.deallocateInstance(blockKey, alloc.instanceIndex, alloc.blockType, alloc.faceType);
+      this.deallocateInstance(blockKey, alloc.instanceIndex, alloc.blockType, alloc.faceType, alloc.aoType);
     });
 
     // Clear the allocation tracking
@@ -211,45 +223,42 @@ export default class ChunkInstancedBlockManager {
   /**
    * Get the pool for a specific combination
    */
-  private getPool(blockType: BlockKeys, faceType: BlockTextureType) {
+  private getPool(blockType: BlockKeys, faceType: BlockTextureType, aoType: FaceAoType | "base") {
     try {
-      return this.instancedMeshes[blockType][faceType];
+      return this.instancedMeshes[blockType][faceType][aoType];
     } catch (e) {
-      console.error(`Pool not found for blockType: ${blockType}, faceType: ${faceType} in chunk ${this.chunkName}`);
+      console.error(`Pool not found for blockType: ${blockType}, faceType: ${faceType}, aoType: ${aoType} in chunk ${this.chunkName}`);
       return null;
     }
   }
 
-  /**
-   * Convert AO type to numeric value for shader
-   */
-  private getAOValue(aoType: FaceAoType | "base"): number {
-    if (aoType === "base") return 0;
-    return aoType as number;
-  }
+
 
   /**
    * Resize a pool when it runs out of available indices
    */
-  private resizePool(blockType: BlockKeys, faceType: BlockTextureType) {
-    const pool = this.getPool(blockType, faceType);
+  private resizePool(blockType: BlockKeys, faceType: BlockTextureType, aoType: FaceAoType | "base") {
+    const pool = this.getPool(blockType, faceType, aoType);
     if (!pool) return;
 
     const oldSize = pool.mesh.instanceMatrix.count;
     const newSize = Math.floor(oldSize * this.poolGrowthFactor);
     
-    console.log(`Resizing pool for ${blockType}_${faceType} in chunk ${this.chunkName} from ${oldSize} to ${newSize}`);
+    console.log(`Resizing pool for ${blockType}_${faceType}_${aoType} in chunk ${this.chunkName} from ${oldSize} to ${newSize}`);
 
-    // Create new larger InstancedMesh
+    // Get the AO material from blocks data
     const blockData = blocks[blockType];
-    const material = blockData.texture[faceType];
-    const newInstancedMesh = new InstancedMesh(renderGeometry, material, newSize);
+    const aoMaterials = blockData.textureFaceAo[faceType];
+    const aoMaterial = aoMaterials[aoType];
+    
+    // Create new larger InstancedMesh
+    const newInstancedMesh = new InstancedMesh(renderGeometry, aoMaterial, newSize);
     
     // Position at chunk center
     newInstancedMesh.position.copy(this.chunkCenter);
     newInstancedMesh.instanceMatrix.setUsage(35048);
     newInstancedMesh.count = pool.mesh.count;
-    newInstancedMesh.name = `${this.chunkName}_${blockType}_${faceType}`;
+    newInstancedMesh.name = `${this.chunkName}_${blockType}_${faceType}_${aoType}`;
 
     // Copy existing instance matrices
     for (let i = 0; i < oldSize; i++) {
@@ -257,14 +266,6 @@ export default class ChunkInstancedBlockManager {
       pool.mesh.getMatrixAt(i, matrix);
       newInstancedMesh.setMatrixAt(i, matrix);
     }
-
-    // Copy AO attributes
-    const oldAO = pool.mesh.geometry.getAttribute('instanceAO') as InstancedBufferAttribute;
-    const newAO = new InstancedBufferAttribute(new Float32Array(newSize), 1);
-    for (let i = 0; i < oldSize; i++) {
-      newAO.setX(i, oldAO.getX(i));
-    }
-    newInstancedMesh.geometry.setAttribute('instanceAO', newAO);
 
     // Remove old mesh and add new one
     this.blocksGroup.remove(pool.mesh);
@@ -329,10 +330,13 @@ export default class ChunkInstancedBlockManager {
       Object.keys(this.instancedMeshes).forEach((blockType) => {
         const blockMeshes = this.instancedMeshes[parseInt(blockType) as BlockKeys];
         Object.keys(blockMeshes).forEach((faceType) => {
-          const pool = blockMeshes[parseInt(faceType) as BlockTextureType];
-          if (pool?.mesh) {
-            pool.mesh.frustumCulled = !shouldRender;
-          }
+          const aoVariants = blockMeshes[parseInt(faceType) as BlockTextureType];
+          Object.keys(aoVariants).forEach((aoType) => {
+            const pool = aoVariants[aoType as FaceAoType | "base"];
+            if (pool?.mesh) {
+              pool.mesh.frustumCulled = !shouldRender;
+            }
+          });
         });
       });
     }
@@ -354,11 +358,14 @@ export default class ChunkInstancedBlockManager {
     Object.keys(this.instancedMeshes).forEach((blockType) => {
       const blockMeshes = this.instancedMeshes[parseInt(blockType) as BlockKeys];
       Object.keys(blockMeshes).forEach((faceType) => {
-        const pool = blockMeshes[parseInt(faceType) as BlockTextureType];
-        if (pool?.mesh) {
-          this.blocksGroup.remove(pool.mesh);
-          pool.mesh.dispose();
-        }
+        const aoVariants = blockMeshes[parseInt(faceType) as BlockTextureType];
+        Object.keys(aoVariants).forEach((aoType) => {
+          const pool = aoVariants[aoType as FaceAoType | "base"];
+          if (pool?.mesh) {
+            this.blocksGroup.remove(pool.mesh);
+            pool.mesh.dispose();
+          }
+        });
       });
     });
     
@@ -374,15 +381,18 @@ export default class ChunkInstancedBlockManager {
     Object.keys(this.instancedMeshes).forEach((blockType) => {
       const blockMeshes = this.instancedMeshes[parseInt(blockType) as BlockKeys];
       Object.keys(blockMeshes).forEach((faceType) => {
-        const pool = blockMeshes[parseInt(faceType) as BlockTextureType];
-        if (pool?.mesh) {
-          const key = `${this.chunkName}_${blockType}_${faceType}`;
-          stats[key] = {
-            totalInstances: pool.mesh.instanceMatrix.count,
-            usedInstances: pool.count,
-            availableInstances: pool.indexCanAllocate.length
-          };
-        }
+        const aoVariants = blockMeshes[parseInt(faceType) as BlockTextureType];
+        Object.keys(aoVariants).forEach((aoType) => {
+          const pool = aoVariants[aoType as FaceAoType | "base"];
+          if (pool?.mesh) {
+            const key = `${this.chunkName}_${blockType}_${faceType}_${aoType}`;
+            stats[key] = {
+              totalInstances: pool.mesh.instanceMatrix.count,
+              usedInstances: pool.count,
+              availableInstances: pool.indexCanAllocate.length
+            };
+          }
+        });
       });
     });
     

@@ -72,11 +72,11 @@ export interface BlocksIntancedMapping
 export interface BlocksIntancedType
   extends Record<
     BlockTextureType,
-    {
+    Record<FaceAoType | "base", {
       mesh: InstancedMesh;
       count: number;
       indexCanAllocate: number[];
-    }
+    }>
   > {}
 
 export type BlocksType = Record<

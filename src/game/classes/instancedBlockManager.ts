@@ -105,7 +105,18 @@ export default class InstancedBlockManager {
     
     const chunkManager = this.chunkManagers.get(chunkName);
     if (chunkManager) {
-      chunkManager.deallocateInstance(blockKey, instanceIndex, blockType, faceType);
+      // Find the allocation to get the AO type
+      const allocations = chunkManager['instanceAllocations'].get(blockKey);
+      if (allocations) {
+        const allocation = allocations.find(a => 
+          a.instanceIndex === instanceIndex && 
+          a.blockType === blockType && 
+          a.faceType === faceType
+        );
+        if (allocation) {
+          chunkManager.deallocateInstance(blockKey, instanceIndex, blockType, faceType, allocation.aoType);
+        }
+      }
     }
   }
 
