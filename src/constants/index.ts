@@ -12,7 +12,7 @@ export const DEFAULT_WORLD_NAME = "New World";
 
 export const BLOCK_WIDTH = 2;
 
-export const DEFAULT_CHUNK_VIEW = 1;
+export const DEFAULT_CHUNK_VIEW = 15;
 
 // size of chunk in x and z (CHUNK_SIZE * CHUNK_SIZE)
 // when change world data in localstorage must be clear due to different chunksize store data

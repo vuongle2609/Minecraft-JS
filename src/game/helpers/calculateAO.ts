@@ -1,22 +1,19 @@
 import { BLOCK_WIDTH } from "@/constants";
 import { Face } from "@/constants/block";
 import { BlockKeys, FaceAoType } from "@/type";
-import Block from "../classes/block";
 import { nameFromCoordinate } from "./nameFromCoordinate";
 
 const { leftZ, rightZ, leftX, rightX, bottom, top } = Face;
 
+interface BlockLike {
+  type: BlockKeys;
+  position?: number[];
+}
+
 const getBlockOffset = (
   positionOffset: number[],
   position: number[],
-  blocksInChunk: Map<
-    string,
-    | {
-        position: number[];
-        type: BlockKeys;
-      }
-    | Block
-  > = new Map()
+  blocksInChunk: Map<string, BlockLike> = new Map()
 ) => {
   const [x1, y1, z1] = positionOffset;
   const [x, y, z] = position;
@@ -34,14 +31,7 @@ const getBlockOffset = (
 
 export const getFacesOcclusion = (
   position: number[],
-  blocksInChunk: Map<
-    string,
-    | {
-        position: number[];
-        type: BlockKeys;
-      }
-    | Block
-  > = new Map()
+  blocksInChunk: Map<string, BlockLike> = new Map()
 ) => {
   let blockTopType = null;
 

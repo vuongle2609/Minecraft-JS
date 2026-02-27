@@ -1,6 +1,6 @@
 import { GUI } from "dat.gui";
 import { Camera, Scene } from "three";
-import { PointerLockControls } from "three/examples/jsm/controls/PointerLockControls";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 
 import MouseControl from "@/game/action/mouseControl";
 import PhysicsEngine from "@/game/physics/physics";

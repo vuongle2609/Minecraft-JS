@@ -9,11 +9,12 @@ import {
   FogExp2,
   PerspectiveCamera,
   Scene,
-  WebGLRenderer,
-} from "three";
-import { PointerLockControls } from "three/examples/jsm/controls/PointerLockControls";
+  WebGPURenderer,
+} from "three/webgpu";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 
 import { BLOCK_WIDTH } from "@/constants";
+import { buildTextureAtlas } from "@/constants/textureAtlas";
 import ChunkManager from "./chunkManager";
 import Cloud from "./cloud";
 import InventoryManager from "./inventoryManager";
@@ -28,15 +29,9 @@ export default class GameScene extends RenderPage {
 
   removedWindow = false;
 
-  renderer = new WebGLRenderer({
-    antialias: true,
-    canvas: document.querySelector("#gameScene") as HTMLCanvasElement,
-  });
+  renderer: WebGPURenderer;
 
-  rendererDebug = new WebGLRenderer({
-    antialias: true,
-    canvas: document.querySelector("#gameSceneDebug") as HTMLCanvasElement,
-  });
+  rendererDebug: WebGPURenderer;
 
   worker = new Worker(new URL("../physics/worker", import.meta.url), {
     type: "module",
@@ -84,12 +79,22 @@ export default class GameScene extends RenderPage {
     this.initialize();
   }
 
-  initialize() {
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.shadowMap.enabled = false;
+  async initialize() {
+    this.renderer = new WebGPURenderer({
+      antialias: true,
+      canvas: document.querySelector("#gameScene") as HTMLCanvasElement,
+    });
 
+    this.rendererDebug = new WebGPURenderer({
+      antialias: true,
+      canvas: document.querySelector("#gameSceneDebug") as HTMLCanvasElement,
+    });
+
+    await this.renderer.init();
+    await this.rendererDebug.init();
+
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.rendererDebug.setSize(200, 200);
-    this.rendererDebug.shadowMap.enabled = false;
 
     window.addEventListener(
       "resize",
@@ -104,7 +109,9 @@ export default class GameScene extends RenderPage {
     document.body.appendChild(this.element);
 
     this.scene.background = new Color("#6EB1FF");
-    this.scene.fog = new FogExp2(0xcccccc, 0.007);
+    // Fog adjusted for view distance 20 chunks (20*16*2=640 world units)
+    // density ~0.004 fades to full opacity at ~750 units
+    this.scene.fog = new FogExp2(0xcccccc, 0.004);
 
     if (this.worldStorage.rotation)
       this.camera.rotation.fromArray(this.worldStorage.rotation as any);
@@ -138,6 +145,9 @@ export default class GameScene extends RenderPage {
       },
     });
 
+    // Build texture atlas before creating chunk manager
+    const atlas = await buildTextureAtlas();
+
     this.chunkManager = new ChunkManager({
       mouseControl: this.mouseControl,
       scene: this.scene,
@@ -148,6 +158,12 @@ export default class GameScene extends RenderPage {
       id: this.id,
       worldStorage: this.worldStorage,
     });
+
+    this.chunkManager.setAtlas(
+      atlas.uvMap,
+      atlas.opaqueMaterial,
+      atlas.waterMaterial
+    );
 
     this.player = new Player({
       scene: this.scene,
@@ -214,7 +230,7 @@ export default class GameScene extends RenderPage {
     this.infoElement.innerHTML = `
     <div class="flex flex-col">
       <span>Geometries: ${info.memory.geometries} / Textures: ${info.memory.textures}</span>
-      <span>Calls: ${info.render.calls} / Frame: ${info.render.frame} / Lines: ${info.render.lines} / Points: ${info.render.points} / Triangles: ${info.render.triangles}</span>
+      <span>Calls: ${info.render.calls} / Draw: ${info.render.drawCalls} / Lines: ${info.render.lines} / Points: ${info.render.points} / Triangles: ${info.render.triangles}</span>
     </div>
     `;
   }

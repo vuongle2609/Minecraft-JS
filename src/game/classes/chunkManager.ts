@@ -1,4 +1,4 @@
-import { DEFAULT_CHUNK_VIEW } from "@/constants";
+import { DEFAULT_CHUNK_VIEW, BLOCK_WIDTH, CHUNK_SIZE } from "@/constants";
 import { Face } from "@/constants/block";
 import {
   nameChunkFromCoordinate,
@@ -9,10 +9,18 @@ import { BlockKeys, FaceAoType } from "@/type";
 import { throttle } from "@/UI/utils/throttle";
 import { calNeighborsOffset } from "../helpers/calNeighborsOffset";
 import { getChunkNeighborsCoor } from "../helpers/chunkHelpers";
-import { detailFromName } from "../helpers/detailFromName";
 import { BasePropsType } from "./baseEntity";
 import BlockManager from "./blockManager";
 import InventoryManager from "./inventoryManager";
+import { ChunkMesh } from "./chunkMesh";
+import {
+  buildChunkGeometry,
+  BlockData,
+} from "@/game/helpers/chunkGeometryBuilder";
+
+// Distance beyond which chunks are hidden (fog fully obscures)
+// At fog density 0.004, visibility ~= 3/0.004 = 750 units
+const FOG_CUTOFF_DISTANCE = 700;
 
 interface PropsType {
   inventoryManager: InventoryManager;
@@ -36,9 +44,6 @@ type ChunkWorkerDataType = {
 };
 
 export default class ChunkManager extends BlockManager {
-  // todo
-  chunkCached = [];
-
   chunkRendered = new Map();
 
   chunkRenderQueue: ChunkWorkerDataType[] = [];
@@ -47,6 +52,9 @@ export default class ChunkManager extends BlockManager {
   currentChunk = [0, 0];
 
   neighborOffset = calNeighborsOffset(DEFAULT_CHUNK_VIEW);
+
+  // Track which block keys belong to each chunk (for data store management)
+  chunksBlockKeys: Record<string, string[]> = {};
 
   createWorker = (index: number) => ({
     worker: new Worker(new URL("../terrant/worker", import.meta.url), {
@@ -57,7 +65,13 @@ export default class ChunkManager extends BlockManager {
     currentProcessChunk: null,
   });
 
-  chunkWorkers = Array(9)
+  // Dynamic worker pool based on hardware
+  workerCount = Math.min(
+    Math.max((navigator.hardwareConcurrency || 4) - 2, 4),
+    16
+  );
+
+  chunkWorkers = Array(this.workerCount)
     .fill(0)
     .reduce((prev, _, index) => {
       return {
@@ -245,26 +259,45 @@ export default class ChunkManager extends BlockManager {
     this.chunksActive = neighborChunksKeys;
     this.chunkPendingQueueProxy.filterInactive();
 
+    // Sort by distance from player (closest first)
+    chunkDetail.sort((a, b) => {
+      const distA =
+        Math.abs(a.chunk.x - currentChunk.x) +
+        Math.abs(a.chunk.z - currentChunk.z);
+      const distB =
+        Math.abs(b.chunk.x - currentChunk.x) +
+        Math.abs(b.chunk.z - currentChunk.z);
+      return distA - distB;
+    });
+
     chunkDetail.forEach(({ chunkName, chunk }) => {
       this.handleAssignWorkerChunk(chunkName, chunk);
     });
   }
 
   handleRenderChunksInQueue() {
-    const data = this.chunkRenderQueue.pop();
+    const startTime = performance.now();
+    const TIME_BUDGET_MS = 8; // allow 8ms per frame for chunk rendering
 
-    if (!data) return;
+    while (
+      this.chunkRenderQueue.length > 0 &&
+      performance.now() - startTime < TIME_BUDGET_MS
+    ) {
+      const data = this.chunkRenderQueue.pop();
 
-    const { chunkName, arrayBlocksData, facesToRender, blockOcclusion } = data;
+      if (!data) break;
 
-    if (!this.chunksActive.includes(chunkName)) return;
+      const { chunkName, arrayBlocksData, facesToRender, blockOcclusion } = data;
 
-    this.handleRenderChunkBlocks(
-      chunkName,
-      arrayBlocksData,
-      facesToRender,
-      blockOcclusion
-    );
+      if (!this.chunksActive.includes(chunkName)) continue;
+
+      this.handleRenderChunkBlocks(
+        chunkName,
+        arrayBlocksData,
+        facesToRender,
+        blockOcclusion
+      );
+    }
   }
 
   renderChunk = throttle(this.handleRenderChunksInQueue.bind(this), 0);
@@ -311,15 +344,18 @@ export default class ChunkManager extends BlockManager {
     });
   }
 
-  // can optimize worker speed
   handleRenderChunkBlocks(
     chunkName: string,
     arrayBlocksData: Int32Array,
     facesToRender: Record<string, Record<Face, boolean>>,
     blockOcclusion: Record<string, Record<Face, null | FaceAoType>>
   ) {
+    if (!this.opaqueMaterial || !this.waterMaterial) return;
+
+    const blockDataArray: BlockData[] = [];
     const blocksInChunk: string[] = [];
 
+    // Parse arrayBlocksData: [x, y, z, type, x, y, z, type, ...]
     let tmpPos: number[] = [];
     const lengthCached = arrayBlocksData.length;
     for (let index = 0; index < lengthCached; index++) {
@@ -327,23 +363,44 @@ export default class ChunkManager extends BlockManager {
 
       if (tmpPos.length === 3) {
         const key = nameFromCoordinate(tmpPos[0], tmpPos[1], tmpPos[2]);
-        this.updateBlock({
-          x: tmpPos[0],
-          y: tmpPos[1],
-          z: tmpPos[2],
-          type: num,
-          facesToRender: facesToRender[key] || null,
-          blockOcclusion: blockOcclusion[key] || null,
-        });
-        blocksInChunk.push(key);
 
+        // Store in ChunkDataStore (skip destroyed blocks)
+        if (num !== 0) {
+          this.chunkDataStore.setBlock(chunkName, key, num as BlockKeys);
+          blockDataArray.push({
+            x: tmpPos[0],
+            y: tmpPos[1],
+            z: tmpPos[2],
+            type: num as BlockKeys,
+          });
+        }
+
+        blocksInChunk.push(key);
         tmpPos = [];
       } else {
         tmpPos.push(num);
       }
     }
 
-    this.chunksBlocks[chunkName] = blocksInChunk;
+    this.chunksBlockKeys[chunkName] = blocksInChunk;
+
+    // Build merged chunk geometry
+    const geometryData = buildChunkGeometry(
+      blockDataArray,
+      facesToRender,
+      blockOcclusion,
+      this.atlasUVMap
+    );
+
+    // Create or update ChunkMesh
+    let chunkMesh = this.chunkMeshes.get(chunkName);
+    if (!chunkMesh) {
+      chunkMesh = new ChunkMesh(chunkName, this.opaqueMaterial, this.waterMaterial);
+      this.chunkMeshes.set(chunkName, chunkMesh);
+      this.scene?.add(chunkMesh.group);
+    }
+
+    chunkMesh.buildFromGeometryData(geometryData);
   }
 
   handleClearChunks(neighborChunksKeys: string[]) {
@@ -351,26 +408,26 @@ export default class ChunkManager extends BlockManager {
       (item) => !neighborChunksKeys.includes(item)
     );
 
-    let blocksDelete: string[] = [];
+    inactiveChunk.forEach((chunkName) => {
+      this.chunkRendered.set(chunkName, false);
 
-    inactiveChunk.forEach((item) => {
-      this.chunkRendered.set(item, false);
+      // Dispose chunk mesh
+      const chunkMesh = this.chunkMeshes.get(chunkName);
+      if (chunkMesh) {
+        chunkMesh.dispose();
+        this.chunkMeshes.delete(chunkName);
+      }
 
-      blocksDelete = [...blocksDelete, ...(this.chunksBlocks[item] || [])];
+      // Clear block data
+      this.chunkDataStore.clearChunk(chunkName);
 
-      delete this.chunksBlocks[item];
-    });
-
-    blocksDelete.forEach((blockKey) => {
-      const { y, x, z } = detailFromName(blockKey);
-
-      this.removeBlock(x, y, z, true);
+      delete this.chunksBlockKeys[chunkName];
     });
   }
 
   handleAssignWorkerChunk(chunkName: string, chunk: { x: number; z: number }) {
     if (
-      !this.chunksBlocks[chunkName] &&
+      !this.chunksBlockKeys[chunkName] &&
       !Object.values(this.chunkWorkers).find(
         (item) => item.currentProcessChunk === chunkName
       )
@@ -379,8 +436,45 @@ export default class ChunkManager extends BlockManager {
     }
   }
 
+  update() {
+    super.update();
+    this.updateChunkVisibility();
+  }
+
+  // Hide chunks that are beyond the fog cutoff distance
+  updateChunkVisibility() {
+    if (!this.camera) return;
+
+    const camX = this.camera.position.x;
+    const camZ = this.camera.position.z;
+    const chunkWorldSize = CHUNK_SIZE * BLOCK_WIDTH;
+
+    for (const [chunkName, chunkMesh] of this.chunkMeshes) {
+      const parts = chunkName.split("_");
+      const cx = Number(parts[0]);
+      const cz = Number(parts[1]);
+
+      // Chunk center in world space
+      const chunkCenterX = (cx + 0.5) * chunkWorldSize;
+      const chunkCenterZ = (cz + 0.5) * chunkWorldSize;
+
+      const dx = chunkCenterX - camX;
+      const dz = chunkCenterZ - camZ;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+
+      chunkMesh.setVisible(dist < FOG_CUTOFF_DISTANCE);
+    }
+  }
+
   dispose() {
     this.disposeBlockManager();
+
+    // Dispose all chunk meshes
+    for (const [, chunkMesh] of this.chunkMeshes) {
+      chunkMesh.dispose();
+    }
+    this.chunkMeshes.clear();
+
     Object.values(this.chunkWorkers).forEach(({ worker }) => {
       worker.terminate();
     });

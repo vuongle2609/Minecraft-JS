@@ -1,5 +1,3 @@
-import { InstancedMesh, MeshLambertMaterial } from "three";
-
 export enum BlockKeys {
   grass = 1,
   stone = 3,
@@ -17,15 +15,6 @@ export enum BlockKeys {
   blockOfEmerald = 15,
   water = 16,
   bedrock = 17,
-}
-
-export enum BlockTextureType {
-  top,
-  side,
-  sideOther,
-  bottom,
-  front,
-  back,
 }
 
 export enum FaceAoType {
@@ -66,19 +55,6 @@ export interface WorldsType {
   rotation?: number[];
 }
 
-export interface BlocksIntancedMapping
-  extends Record<BlockKeys, BlocksIntancedType> {}
-
-export interface BlocksIntancedType
-  extends Record<
-    BlockTextureType,
-    {
-      mesh: InstancedMesh;
-      count: number;
-      indexCanAllocate: number[];
-    }
-  > {}
-
 export type BlocksType = Record<
   BlockKeys,
   {
@@ -88,12 +64,6 @@ export type BlocksType = Record<
     step: HTMLAudioElement;
     place: HTMLAudioElement;
     break: HTMLAudioElement;
-    volume: 0.1;
-    texture: Record<BlockTextureType, MeshLambertMaterial>;
-    textureMap: BlockTextureType[];
-    textureFaceAo: Record<
-      BlockTextureType,
-      Record<FaceAoType | "base", MeshLambertMaterial>
-    >;
+    volume: number;
   }
 >;

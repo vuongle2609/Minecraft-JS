@@ -1,25 +1,31 @@
 import {
   BoxGeometry,
-  Group,
   Mesh,
+  MeshLambertMaterial,
   MeshStandardMaterial,
-  Vector2,
   Vector3,
 } from "three";
 
 import { Face } from "@/constants/block";
 import blocks from "@/constants/blocks";
+import { type AtlasUV } from "@/constants/textureAtlas";
 import { getChunkCoordinate } from "@/game/helpers/chunkHelpers";
-import { detailFromName } from "@/game/helpers/detailFromName";
 import {
   nameChunkFromCoordinate,
   nameFromCoordinate,
 } from "@/game/helpers/nameFromCoordinate";
 import { BlockKeys, FaceAoType } from "@/type";
+import { voxelRaycast, VoxelHit } from "@/game/helpers/voxelRaycast";
+import {
+  buildChunkGeometry,
+  BlockData,
+} from "@/game/helpers/chunkGeometryBuilder";
+import { recomputeChunkFaces } from "@/game/helpers/recomputeChunkFaces";
 
-import { BLOCK_WIDTH } from "@/constants";
+import { BLOCK_WIDTH, CHUNK_SIZE } from "@/constants";
 import BaseEntity, { BasePropsType } from "./baseEntity";
-import Block from "./block";
+import { ChunkDataStore } from "./chunkDataStore";
+import { ChunkMesh } from "./chunkMesh";
 import InventoryManager from "./inventoryManager";
 
 const { leftX, leftZ, bottom, rightX, rightZ, top } = Face;
@@ -35,14 +41,21 @@ export default class BlockManager extends BaseEntity {
 
   currentBreakSound: HTMLAudioElement;
 
-  blocksMapping: Map<string, Block> = new Map();
-
+  // Persistent block overrides for save data
   blocksWorldChunk: Record<string, Record<string, BlockKeys | 0>> = {};
-  chunksBlocks: Record<string, string[]> = {};
 
   chunksActive: string[] = [];
 
-  blocksGroup = new Group();
+  // New: lightweight block data store
+  chunkDataStore = new ChunkDataStore();
+
+  // New: chunk meshes (merged geometry per chunk)
+  chunkMeshes: Map<string, ChunkMesh> = new Map();
+
+  // Atlas data (set during initialization)
+  atlasUVMap: Record<string, AtlasUV> = {};
+  opaqueMaterial: MeshLambertMaterial | null = null;
+  waterMaterial: MeshLambertMaterial | null = null;
 
   disposeBlockManager: Function;
 
@@ -61,10 +74,19 @@ export default class BlockManager extends BaseEntity {
     this.blocksWorldChunk = props.worldStorage?.blocksWorldChunk || {};
   }
 
+  setAtlas(
+    uvMap: Record<string, AtlasUV>,
+    opaqueMaterial: MeshLambertMaterial,
+    waterMaterial: MeshLambertMaterial
+  ) {
+    this.atlasUVMap = uvMap;
+    this.opaqueMaterial = opaqueMaterial;
+    this.waterMaterial = waterMaterial;
+  }
+
   async initialize() {
     this.blockDisplayHover.name = "helper";
     this.scene?.add(this.blockDisplayHover);
-    this.scene?.add(this.blocksGroup);
 
     const eventMouseDown = this.onMouseDown.bind(this);
 
@@ -83,100 +105,42 @@ export default class BlockManager extends BaseEntity {
     });
   }
 
-  updateBlock({
-    x,
-    y,
-    z,
-    type,
-    facesToRender,
-    blockOcclusion,
-    isPlace,
-  }: {
-    x: number;
-    y: number;
-    z: number;
-    type: BlockKeys | 0;
-    facesToRender?: Record<Face, boolean> | null;
-    blockOcclusion?: Record<Face, null | FaceAoType> | null;
-    isPlace?: boolean;
-  }) {
-    // if block marked as destroyed then return
-    if (type == 0) {
-      return;
-    }
+  // Get the targeted block using DDA voxel raycasting
+  getIntersectBlock(): VoxelHit | null {
+    if (!this.camera || !this.scene || !this.control?.isLocked) return null;
 
-    const position = new Vector3(x, y, z);
+    const origin = this.camera.position.clone();
+    const direction = new Vector3();
+    this.camera.getWorldDirection(direction);
 
-    const block = new Block({
-      position: position,
-      type: type,
-      blocksMapping: this.blocksMapping,
-      facesToRender,
-      blocksGroup: this.blocksGroup,
-      blockOcclusion,
-    });
-
-    this.blocksMapping.set(nameFromCoordinate(x, y, z), block);
-    if (isPlace) block.calculateAONeighbors();
-  }
-
-  getIntersectObject() {
-    const { raycaster } = this.mouseControl! || {};
-
-    if (!this.camera || !this.scene || !this.control?.isLocked) return;
-
-    raycaster.setFromCamera(new Vector2(), this.camera);
-
-    const intersectObject = raycaster.intersectObjects(
-      this.blocksGroup.children,
-      false
-    )[0];
-
-    if (!intersectObject) return;
-
-    if (intersectObject.distance > 12) return;
-
-    return intersectObject;
-  }
-
-  removeBlock(x: number, y: number, z: number, isClearChunk?: boolean) {
-    const blockToRemove = this.blocksMapping.get(nameFromCoordinate(x, y, z));
-
-    blockToRemove?.destroy(isClearChunk);
+    return voxelRaycast(origin, direction, 12, this.chunkDataStore);
   }
 
   handleHoverBlock() {
-    const intersectObj = this.getIntersectObject();
+    const hit = this.getIntersectBlock();
 
-    if (!intersectObj) {
+    if (!hit) {
       this.blockDisplayHover.visible = false;
       return;
     }
 
-    const { x, y, z, type } = detailFromName(intersectObj.object.name);
-
-    if (type == BlockKeys.water) {
+    if (hit.type == BlockKeys.water) {
       this.blockDisplayHover.visible = false;
       return;
     }
 
     this.blockDisplayHover.visible = true;
-    this.blockDisplayHover.position.set(x, y, z);
+    this.blockDisplayHover.position.set(hit.x, hit.y, hit.z);
   }
 
   handleGetBlock() {
-    const intersectObj = this.getIntersectObject();
+    const hit = this.getIntersectBlock();
+    if (!hit) return;
 
-    if (!intersectObj) return;
-
-    const clickedDetail = detailFromName(intersectObj.object.name);
-
-    const { type } = clickedDetail;
-
-    if (!blocks[type].renderInInventory) return;
+    if (!blocks[hit.type].renderInInventory) return;
 
     this.inventoryManager.inventory[this.inventoryManager.currentFocusIndex] =
-      type;
+      hit.type;
 
     this.inventoryManager.renderHotbar();
 
@@ -187,88 +151,77 @@ export default class BlockManager extends BaseEntity {
   }
 
   handleBreakBlock() {
-    const intersectObj = this.getIntersectObject();
+    const hit = this.getIntersectBlock();
+    if (!hit) return;
 
-    if (!intersectObj) return;
-
-    const clickedDetail = detailFromName(intersectObj.object.name);
-
-    const { x, y, z, type } = clickedDetail;
+    const { x, y, z, type } = hit;
 
     if (type == BlockKeys.bedrock) return;
     if (type == BlockKeys.water) return;
 
-    this.removeBlock(x, y, z);
+    // Remove from data store
+    const chunk = getChunkCoordinate(x, z);
+    const chunkName = nameChunkFromCoordinate(chunk.x, chunk.z);
+    const coordKey = nameFromCoordinate(x, y, z);
 
-    this.removeBlockWorker({
-      position: [x, y, z],
-    });
+    this.chunkDataStore.removeBlock(chunkName, coordKey);
 
-    const newUpdateBlockChunk = getChunkCoordinate(x, z);
-    const chunkName = nameChunkFromCoordinate(
-      newUpdateBlockChunk.x,
-      newUpdateBlockChunk.z
-    );
+    // Notify physics worker
+    this.removeBlockWorker({ position: [x, y, z] });
 
+    // Update persistence
     this.blocksWorldChunk[chunkName] = this.blocksWorldChunk[chunkName] || {};
-    this.blocksWorldChunk[chunkName][nameFromCoordinate(x, y, z)] = 0;
+    this.blocksWorldChunk[chunkName][coordKey] = 0;
 
-    // play sound
+    // Rebuild affected chunk meshes
+    this.rebuildAffectedChunks(x, y, z);
+
+    // Play sound
     if (this.currentBreakSound) {
       this.currentBreakSound.pause();
       this.currentBreakSound.currentTime = 0;
     }
 
     this.currentBreakSound = blocks[type].break;
-
     this.currentBreakSound.play();
   }
 
   handleRenderPlaceBlock(blockPositionArr: number[], placeType: BlockKeys) {
     const [x, y, z] = blockPositionArr;
-    this.updateBlock({
-      x,
-      y,
-      z,
-      type: placeType,
-      isPlace: true,
-    });
 
+    // Add to data store
     const chunk = getChunkCoordinate(x, z);
     const chunkName = nameChunkFromCoordinate(chunk.x, chunk.z);
+    const coordKey = nameFromCoordinate(x, y, z);
 
-    const coorName = nameFromCoordinate(x, y, z);
+    this.chunkDataStore.setBlock(chunkName, coordKey, placeType);
 
-    this.chunksBlocks[chunkName]?.push(coorName);
-
+    // Update persistence
     this.blocksWorldChunk[chunkName] = this.blocksWorldChunk[chunkName] || {};
-    this.blocksWorldChunk[chunkName][coorName] = placeType;
+    this.blocksWorldChunk[chunkName][coordKey] = placeType;
 
-    // play sound
+    // Rebuild affected chunk meshes
+    this.rebuildAffectedChunks(x, y, z);
+
+    // Play sound
     if (this.currentPlaceSound) {
       this.currentPlaceSound.pause();
       this.currentPlaceSound.currentTime = 0;
     }
 
     this.currentPlaceSound = blocks[placeType].place;
-
     this.currentPlaceSound.play();
   }
 
   handlePlaceBlock() {
-    const intersectObj = this.getIntersectObject();
+    const hit = this.getIntersectBlock();
+    if (!hit) return;
 
-    if (!intersectObj) return;
-
-    const clickedDetail = detailFromName(intersectObj.object.name);
-
-    const clickedFace = clickedDetail.face;
-
-    const { x, y, z } = clickedDetail;
+    const { x, y, z, face } = hit;
 
     const blockPosition = new Vector3();
 
-    switch (Number(clickedFace)) {
+    switch (face) {
       case leftX:
         blockPosition.set(x + BLOCK_WIDTH, y, z);
         break;
@@ -297,6 +250,80 @@ export default class BlockManager extends BaseEntity {
         type: placeType,
       });
     }
+  }
+
+  // Rebuild chunk meshes affected by a block change at (bx, by, bz)
+  rebuildAffectedChunks(bx: number, by: number, bz: number) {
+    const mainChunk = getChunkCoordinate(bx, bz);
+    const mainChunkName = nameChunkFromCoordinate(mainChunk.x, mainChunk.z);
+    this.rebuildChunkMesh(mainChunkName);
+
+    // Only rebuild neighbor chunks if block is on this chunk's boundary
+    const chunkWorldSize = CHUNK_SIZE * BLOCK_WIDTH;
+    const localX = bx - mainChunk.x * chunkWorldSize;
+    const localZ = bz - mainChunk.z * chunkWorldSize;
+    const maxLocal = (CHUNK_SIZE - 1) * BLOCK_WIDTH;
+
+    if (localX === 0) {
+      const n = nameChunkFromCoordinate(mainChunk.x - 1, mainChunk.z);
+      if (n !== mainChunkName) this.rebuildChunkMesh(n);
+    }
+    if (localX === maxLocal) {
+      const n = nameChunkFromCoordinate(mainChunk.x + 1, mainChunk.z);
+      if (n !== mainChunkName) this.rebuildChunkMesh(n);
+    }
+    if (localZ === 0) {
+      const n = nameChunkFromCoordinate(mainChunk.x, mainChunk.z - 1);
+      if (n !== mainChunkName) this.rebuildChunkMesh(n);
+    }
+    if (localZ === maxLocal) {
+      const n = nameChunkFromCoordinate(mainChunk.x, mainChunk.z + 1);
+      if (n !== mainChunkName) this.rebuildChunkMesh(n);
+    }
+  }
+
+  // Rebuild the mesh for a single chunk using current ChunkDataStore data
+  rebuildChunkMesh(chunkName: string) {
+    if (!this.opaqueMaterial || !this.waterMaterial) return;
+
+    const chunkBlocks = this.chunkDataStore.getChunkBlocks(chunkName);
+    if (!chunkBlocks) return;
+
+    // Recompute faces and AO
+    const { facesToRender, blockOcclusion } = recomputeChunkFaces(
+      this.chunkDataStore,
+      chunkBlocks
+    );
+
+    // Build block data array
+    const blockDataArray: BlockData[] = [];
+    for (const [key, type] of chunkBlocks) {
+      const parts = key.split("_");
+      blockDataArray.push({
+        x: Number(parts[0]),
+        y: Number(parts[1]),
+        z: Number(parts[2]),
+        type,
+      });
+    }
+
+    // Build geometry
+    const geometryData = buildChunkGeometry(
+      blockDataArray,
+      facesToRender,
+      blockOcclusion,
+      this.atlasUVMap
+    );
+
+    // Update or create ChunkMesh
+    let chunkMesh = this.chunkMeshes.get(chunkName);
+    if (!chunkMesh) {
+      chunkMesh = new ChunkMesh(chunkName, this.opaqueMaterial, this.waterMaterial);
+      this.chunkMeshes.set(chunkName, chunkMesh);
+      this.scene?.add(chunkMesh.group);
+    }
+
+    chunkMesh.buildFromGeometryData(geometryData);
   }
 
   removeBlockWorker({ position }: { position: number[] }) {
